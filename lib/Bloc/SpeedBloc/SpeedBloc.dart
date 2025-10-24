@@ -4,7 +4,7 @@ import 'package:flutter_bloc/flutter_bloc.dart';
 import 'package:geolocator/geolocator.dart';
 import 'package:sensors_plus/sensors_plus.dart';
 
-/// Events
+/// EVENTS
 abstract class SpeedEvent {}
 class StartTracking extends SpeedEvent {}
 class StopTracking extends SpeedEvent {}
@@ -13,7 +13,7 @@ class _SpeedUpdate extends SpeedEvent {
   _SpeedUpdate(this.speedKmh);
 }
 
-/// States
+/// STATES
 abstract class SpeedState {}
 class SpeedInitial extends SpeedState {}
 class SpeedLoading extends SpeedState {}
@@ -26,13 +26,45 @@ class SpeedError extends SpeedState {
   SpeedError(this.message);
 }
 
-/// BLoC
+/// --- Simple Kalman Filter ---
+class KalmanFilter {
+  double _estimate = 0.0;
+  double _errorEstimate = 1.0;
+  final double _errorMeasure;
+  final double _processNoise;
+
+  KalmanFilter({
+    double errorMeasure = 1.0,
+    double processNoise = 0.01,
+  })  : _errorMeasure = errorMeasure,
+        _processNoise = processNoise;
+
+  double filter(double measurement) {
+    _errorEstimate += _processNoise;
+    double kalmanGain = _errorEstimate / (_errorEstimate + _errorMeasure);
+    _estimate = _estimate + kalmanGain * (measurement - _estimate);
+    _errorEstimate = (1 - kalmanGain) * _errorEstimate;
+    return _estimate;
+  }
+
+  void reset() {
+    _estimate = 0.0;
+    _errorEstimate = 1.0;
+  }
+}
+
+/// --- BLOC ---
 class SpeedBloc extends Bloc<SpeedEvent, SpeedState> {
   StreamSubscription<Position>? _positionStream;
   StreamSubscription<AccelerometerEvent>? _accelStream;
+  Timer? _fusionTimer;
+
+  final KalmanFilter _kalman = KalmanFilter(errorMeasure: 1.5, processNoise: 0.05);
 
   double _currentSpeed = 0.0;
   double _accMagnitude = 0.0;
+  double _gpsSpeed = 0.0;
+  DateTime _lastGpsUpdate = DateTime.now();
 
   SpeedBloc() : super(SpeedInitial()) {
     on<StartTracking>(_onStartTracking);
@@ -42,8 +74,8 @@ class SpeedBloc extends Bloc<SpeedEvent, SpeedState> {
 
   Future<void> _onStartTracking(StartTracking event, Emitter<SpeedState> emit) async {
     emit(SpeedLoading());
-
     try {
+      // Check GPS
       bool serviceEnabled = await Geolocator.isLocationServiceEnabled();
       if (!serviceEnabled) {
         emit(SpeedError("Location services are disabled."));
@@ -58,20 +90,22 @@ class SpeedBloc extends Bloc<SpeedEvent, SpeedState> {
           return;
         }
       }
-
       if (permission == LocationPermission.deniedForever) {
         emit(SpeedError(
-            "Location permissions are permanently denied. Please enable them in settings."));
+            "Location permissions are permanently denied. Enable them in settings."));
         return;
       }
 
-      // Accelerometer stream
+      // --- Accelerometer Stream ---
       _accelStream?.cancel();
       _accelStream = accelerometerEvents.listen((event) {
-        _accMagnitude = sqrt(event.x * event.x + event.y * event.y + event.z * event.z);
+        // Compute motion magnitude
+        final mag = sqrt(event.x * event.x + event.y * event.y + event.z * event.z);
+        final motion = (mag - 9.8).abs(); // remove gravity
+        _accMagnitude = motion < 0.15 ? 0.0 : motion; // noise filter
       });
 
-      // GPS stream
+      // --- GPS Stream ---
       _positionStream?.cancel();
       _positionStream = Geolocator.getPositionStream(
         locationSettings: const LocationSettings(
@@ -79,32 +113,66 @@ class SpeedBloc extends Bloc<SpeedEvent, SpeedState> {
           distanceFilter: 0,
         ),
       ).listen((pos) {
-        double gpsKmh = pos.speed * 3.6;
-        // Filter: if GPS reports tiny speed but phone is stationary, set 0
-        if (gpsKmh < 1.0 && _accMagnitude < 0.1) gpsKmh = 0.0;
+        _gpsSpeed = pos.speed * 3.6; // m/s → km/h
+        _lastGpsUpdate = DateTime.now();
+      });
 
-        // Smooth the speed using simple low-pass filter
-        _currentSpeed = _currentSpeed + (gpsKmh - _currentSpeed) * 0.2;
+      // --- Sensor Fusion ---
+      _fusionTimer?.cancel();
+      _fusionTimer = Timer.periodic(const Duration(milliseconds: 250), (timer) {
+        if (isClosed) {
+          timer.cancel();
+          return;
+        }
+
+        final gpsStale = DateTime.now().difference(_lastGpsUpdate).inMilliseconds > 3000;
+
+        // If GPS is stale, rely more on accelerometer prediction
+        double fusedSpeed;
+        if (gpsStale) {
+          // Small predicted increase if moving
+          fusedSpeed = _currentSpeed + _accMagnitude * 0.4;
+        } else {
+          // Combine GPS + motion input
+          fusedSpeed = (_gpsSpeed * 0.85) + (_accMagnitude * 1.2);
+        }
+
+        // Apply Kalman smoothing
+        double filtered = _kalman.filter(fusedSpeed);
+
+        // Detect stationary state
+        if (filtered < 0.5 && _accMagnitude < 0.2) {
+          filtered = 0.0;
+          _kalman.reset();
+        }
+
+        // Clamp and store
+        filtered = filtered.clamp(0.0, 240.0);
+        _currentSpeed = filtered;
 
         if (!isClosed) add(_SpeedUpdate(_currentSpeed));
       });
     } catch (e) {
-      emit(SpeedError(e.toString()));
+      emit(SpeedError("Speed tracking error: $e"));
     }
   }
 
   Future<void> _onStopTracking(StopTracking event, Emitter<SpeedState> emit) async {
     await _positionStream?.cancel();
     await _accelStream?.cancel();
+    _fusionTimer?.cancel();
     _currentSpeed = 0.0;
     _accMagnitude = 0.0;
+    _gpsSpeed = 0.0;
+    _kalman.reset();
     emit(SpeedInitial());
   }
 
   @override
-  Future<void> close() {
-    _positionStream?.cancel();
-    _accelStream?.cancel();
+  Future<void> close() async {
+    await _positionStream?.cancel();
+    await _accelStream?.cancel();
+    _fusionTimer?.cancel();
     return super.close();
   }
 }

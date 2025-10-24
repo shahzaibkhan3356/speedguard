@@ -1,5 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_bloc/flutter_bloc.dart';
+import 'package:get/get.dart';
+import 'package:just_audio/just_audio.dart';
 import '../../Bloc/SpeedBloc/SpeedBloc.dart';
 import '../../Bloc/SpeedLimitBloc/SpeedLimitBloc.dart';
 import '../../core/widgets/speedlimit.dart';
@@ -13,6 +15,8 @@ class SpeedPage extends StatelessWidget {
     return GestureDetector(
       onTap: () => FocusScope.of(context).unfocus(),
       child: Scaffold(
+
+
         backgroundColor: Colors.black87,
         resizeToAvoidBottomInset: true,
         body: SafeArea(
@@ -65,6 +69,7 @@ class SpeedPage extends StatelessWidget {
             ),
           ),
         ),
+
       ),
     );
 
