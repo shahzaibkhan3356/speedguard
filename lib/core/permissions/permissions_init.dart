@@ -5,6 +5,10 @@ import 'package:permission_handler/permission_handler.dart';
 import 'package:geolocator/geolocator.dart';
 import 'package:speedguard/features/speedometer/speedscreen.dart';
 
+/// Permission initialization screen
+///
+/// Handles requesting and validating all required permissions before
+/// allowing access to the main speedometer screen.
 class PermissionInitializer extends StatefulWidget {
   const PermissionInitializer({super.key});
 
@@ -33,63 +37,133 @@ class _PermissionInitializerState extends State<PermissionInitializer>
   /// Detects when user returns from Settings or background
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
-    if (state == AppLifecycleState.resumed) {
-      _checkLocationService(); // Recheck when returning
+    if (state == AppLifecycleState.resumed && !_checking) {
+      // Reset dialog flag when returning from settings
+      _dialogShown = false;
+      _checkPermissionsAndContinue();
     }
   }
 
+  /// Initialize permissions flow
   Future<void> _initialize() async {
     await _requestAllPermissions();
-    await _checkLocationService();
   }
 
-  /// Ask all required permissions
+  /// Request all required permissions
   Future<void> _requestAllPermissions() async {
-    final fg = await Permission.locationWhenInUse.request();
-    await Permission.notification.request();
-    await Permission.audio.request();
+    try {
+      final fg = await Permission.locationWhenInUse.request();
+      await Permission.notification.request();
+      await Permission.audio.request();
 
-    if (!fg.isGranted && !_dialogShown) {
-      _dialogShown = true;
-      _showPermissionDialog();
-      return;
+      // Check if location permission granted
+      if (!fg.isGranted) {
+        if (!_dialogShown) {
+          _dialogShown = true;
+          _showPermissionDialog();
+        }
+        return;
+      }
+
+      // Location permission granted, now check GPS service
+      await _checkLocationService();
+    } catch (e) {
+      if (!_dialogShown && mounted) {
+        _dialogShown = true;
+        _showErrorDialog("Permission error: $e");
+      }
     }
   }
 
-  /// Check if GPS is ON
+  /// Check if GPS is enabled
   Future<void> _checkLocationService() async {
-    bool isServiceEnabled = await Geolocator.isLocationServiceEnabled();
+    try {
+      bool isServiceEnabled = await Geolocator.isLocationServiceEnabled();
 
-    if (!isServiceEnabled && !_dialogShown) {
-      _dialogShown = true;
-      _showLocationServiceDialog();
-      return;
+      if (!isServiceEnabled) {
+        if (!_dialogShown && mounted) {
+          _dialogShown = true;
+          _showLocationServiceDialog();
+        }
+        return;
+      }
+
+      // All permissions granted and GPS enabled - proceed to main screen
+      await _navigateToMainScreen();
+    } catch (e) {
+      if (!_dialogShown && mounted) {
+        _dialogShown = true;
+        _showErrorDialog("Location service error: $e");
+      }
     }
+  }
 
-    // When all okay
+  /// Recheck permissions when returning from settings
+  Future<void> _checkPermissionsAndContinue() async {
+    setState(() => _checking = true);
+
+    final fg = await Permission.locationWhenInUse.status;
+
+    if (fg.isGranted) {
+      await _checkLocationService();
+    } else {
+      setState(() => _checking = false);
+      if (!_dialogShown) {
+        _dialogShown = true;
+        _showPermissionDialog();
+      }
+    }
+  }
+
+  /// Navigate to main speed screen
+  Future<void> _navigateToMainScreen() async {
     if (mounted) {
       setState(() => _checking = false);
-      Get.offAll(const SpeedPage());
+
+      // Small delay to show ready state
+      await Future.delayed(const Duration(milliseconds: 300));
+
+      if (mounted) {
+        Get.offAll(() => const SpeedPage());
+      }
     }
   }
 
-  /// Permission dialog
+  /// Show permission denied dialog
   void _showPermissionDialog() {
+    if (!mounted) return;
+
     showDialog(
       context: context,
       barrierDismissible: false,
       builder: (context) => AlertDialog(
         title: const Text("Permissions Required"),
         content: const Text(
-          "Location, audio, or notification permissions are denied. "
-              "Please enable them in settings to use the app.",
+          "Location, audio, and notification permissions are required to use this app.\n\n"
+              "Please enable them in settings to continue.",
         ),
         actions: [
           TextButton(
             onPressed: () async {
               Navigator.pop(context);
               _dialogShown = false;
-              await openAppSettings();
+
+              try {
+                final opened = await openAppSettings();
+                if (!opened) {
+                  Fluttertoast.showToast(
+                    msg: "Could not open settings. Please open manually.",
+                    backgroundColor: Colors.orange,
+                    toastLength: Toast.LENGTH_LONG,
+                  );
+                }
+              } catch (e) {
+                Fluttertoast.showToast(
+                  msg: "Error opening settings: $e",
+                  backgroundColor: Colors.red,
+                  toastLength: Toast.LENGTH_LONG,
+                );
+              }
             },
             child: const Text("Open Settings"),
           ),
@@ -98,28 +172,64 @@ class _PermissionInitializerState extends State<PermissionInitializer>
     );
   }
 
-  /// GPS disabled dialog
+  /// Show GPS disabled dialog
   void _showLocationServiceDialog() {
+    if (!mounted) return;
+
     showDialog(
       context: context,
       barrierDismissible: false,
       builder: (context) => AlertDialog(
         title: const Text("Enable Location Service"),
         content: const Text(
-          "Your device GPS is turned off. Please enable it to continue.",
+          "Your device GPS is turned off. Please enable it to use the speedometer.",
         ),
         actions: [
           TextButton(
             onPressed: () async {
               Navigator.pop(context);
               _dialogShown = false;
-              await Geolocator.openLocationSettings();
-              Fluttertoast.showToast(
-                msg: "Turn on Location and reopen the app.",
-                backgroundColor: Colors.red,
-              );
+
+              try {
+                await Geolocator.openLocationSettings();
+                Fluttertoast.showToast(
+                  msg: "Please turn on Location and return to the app.",
+                  backgroundColor: Colors.orange,
+                  toastLength: Toast.LENGTH_LONG,
+                );
+              } catch (e) {
+                Fluttertoast.showToast(
+                  msg: "Could not open location settings: $e",
+                  backgroundColor: Colors.red,
+                  toastLength: Toast.LENGTH_LONG,
+                );
+              }
             },
             child: const Text("Open Settings"),
+          ),
+        ],
+      ),
+    );
+  }
+
+  /// Show generic error dialog
+  void _showErrorDialog(String message) {
+    if (!mounted) return;
+
+    showDialog(
+      context: context,
+      barrierDismissible: false,
+      builder: (context) => AlertDialog(
+        title: const Text("Error"),
+        content: Text(message),
+        actions: [
+          TextButton(
+            onPressed: () {
+              Navigator.pop(context);
+              _dialogShown = false;
+              _initialize(); // Retry
+            },
+            child: const Text("Retry"),
           ),
         ],
       ),
@@ -132,10 +242,20 @@ class _PermissionInitializerState extends State<PermissionInitializer>
       backgroundColor: Colors.black,
       body: Center(
         child: _checking
-            ? const CircularProgressIndicator(color: Colors.white)
+            ? Column(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: const [
+            CircularProgressIndicator(color: Colors.white),
+
+          ],
+        )
             : const Text(
           "Ready!",
-          style: TextStyle(color: Colors.white),
+          style: TextStyle(
+            color: Colors.white,
+            fontSize: 24,
+            fontWeight: FontWeight.bold,
+          ),
         ),
       ),
     );
