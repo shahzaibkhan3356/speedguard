@@ -4,120 +4,52 @@ import 'package:flutter_bloc/flutter_bloc.dart';
 import 'package:geolocator/geolocator.dart';
 import 'package:sensors_plus/sensors_plus.dart';
 
-/// Configuration constants
-class SpeedConfig {
-  static const Duration fusionUpdateInterval = Duration(milliseconds: 250);
-  static const double accelMultiplier = 0.4;
-  static const double gpsWeight = 0.85;
-  static const double accelWeight = 1.2;
-  static const int gpsStaleThresholdMs = 3000;
-  static const double stationarySpeedThreshold = 0.5;
-  static const double stationaryAccelThreshold = 0.2;
-  static const double gravityMagnitude = 9.8;
-  static const double accelNoiseFilter = 0.15;
-  static const double maxSpeed = 240.0;
-}
-
-/// EVENTS
 abstract class SpeedEvent {}
-
 class StartTracking extends SpeedEvent {}
-
 class StopTracking extends SpeedEvent {}
-
 class _SpeedUpdate extends SpeedEvent {
   final double speedKmh;
   _SpeedUpdate(this.speedKmh);
 }
 
-/// STATES
 abstract class SpeedState {}
-
 class SpeedInitial extends SpeedState {}
-
 class SpeedLoading extends SpeedState {}
-
 class SpeedUpdated extends SpeedState {
   final double speedKmh;
   SpeedUpdated(this.speedKmh);
 }
-
 class SpeedError extends SpeedState {
   final String message;
   SpeedError(this.message);
 }
 
-/// Simple Kalman Filter for speed smoothing
-class KalmanFilter {
-  double _estimate = 0.0;
-  double _errorEstimate = 1.0;
-  final double _errorMeasure;
-  final double _processNoise;
-
-  KalmanFilter({
-    double errorMeasure = 1.0,
-    double processNoise = 0.01,
-  })  : _errorMeasure = errorMeasure,
-        _processNoise = processNoise;
-
-  /// Apply Kalman filter to measurement
-  double filter(double measurement) {
-    _errorEstimate += _processNoise;
-    double kalmanGain = _errorEstimate / (_errorEstimate + _errorMeasure);
-    _estimate = _estimate + kalmanGain * (measurement - _estimate);
-    _errorEstimate = (1 - kalmanGain) * _errorEstimate;
-    return _estimate;
-  }
-
-  /// Reset filter state
-  void reset() {
-    _estimate = 0.0;
-    _errorEstimate = 1.0;
-  }
-}
-
-/// BLoC for real-time speed tracking using GPS and accelerometer fusion
-///
-/// Uses a Kalman filter to smooth speed readings and handles GPS dropout
-/// gracefully by predicting speed from accelerometer data.
 class SpeedBloc extends Bloc<SpeedEvent, SpeedState> {
   StreamSubscription<Position>? _positionStream;
   StreamSubscription<AccelerometerEvent>? _accelStream;
-  Timer? _fusionTimer;
-
-  final KalmanFilter _kalman = KalmanFilter(
-    errorMeasure: 1.5,
-    processNoise: 0.05,
-  );
 
   double _currentSpeed = 0.0;
   double _accMagnitude = 0.0;
-  double _gpsSpeed = 0.0;
-  DateTime? _lastGpsUpdate; // Nullable to detect initial state
+  double _gravityX = 0, _gravityY = 0, _gravityZ = 0;
 
   SpeedBloc() : super(SpeedInitial()) {
     on<StartTracking>(_onStartTracking);
     on<StopTracking>(_onStopTracking);
-    on<_SpeedUpdate>((event, emit) => emit(SpeedUpdated(event.speedKmh)));
+    on<_SpeedUpdate>((event, emit) {
+      if (!isClosed) emit(SpeedUpdated(event.speedKmh));
+    });
   }
 
-  Future<void> _onStartTracking(
-      StartTracking event, Emitter<SpeedState> emit) async {
-    // Clean up any existing streams first
-    await _cleanup();
-
+  Future<void> _onStartTracking(StartTracking event, Emitter<SpeedState> emit) async {
     emit(SpeedLoading());
 
     try {
-      // Check GPS service
-      bool serviceEnabled = await Geolocator.isLocationServiceEnabled();
-      if (!serviceEnabled) {
+      if (!await Geolocator.isLocationServiceEnabled()) {
         emit(SpeedError("Location services are disabled."));
         return;
       }
 
-      // Check permissions
-      LocationPermission permission = await Geolocator.checkPermission();
+      var permission = await Geolocator.checkPermission();
       if (permission == LocationPermission.denied) {
         permission = await Geolocator.requestPermission();
         if (permission == LocationPermission.denied) {
@@ -125,132 +57,67 @@ class SpeedBloc extends Bloc<SpeedEvent, SpeedState> {
           return;
         }
       }
+
       if (permission == LocationPermission.deniedForever) {
-        emit(SpeedError(
-            "Location permissions are permanently denied. Enable them in settings."));
+        emit(SpeedError("Location permissions permanently denied."));
         return;
       }
 
-      // Start accelerometer stream
-      _accelStream = accelerometerEvents.listen(
-            (event) {
-          if (isClosed) return;
+      // Accelerometer listener (gravity-compensated)
+      const alpha = 0.8;
+      _accelStream?.cancel();
+      _accelStream = accelerometerEvents.listen((event) {
+        _gravityX = alpha * _gravityX + (1 - alpha) * event.x;
+        _gravityY = alpha * _gravityY + (1 - alpha) * event.y;
+        _gravityZ = alpha * _gravityZ + (1 - alpha) * event.z;
 
-          // Compute motion magnitude (remove gravity)
-          final mag = sqrt(event.x * event.x + event.y * event.y + event.z * event.z);
-          final motion = (mag - SpeedConfig.gravityMagnitude).abs();
+        final linearX = event.x - _gravityX;
+        final linearY = event.y - _gravityY;
+        final linearZ = event.z - _gravityZ;
 
-          // Apply noise filter
-          _accMagnitude = motion < SpeedConfig.accelNoiseFilter ? 0.0 : motion;
-        },
-        onError: (error) {
-          if (!isClosed) {
-            add(StopTracking());
-            emit(SpeedError("Accelerometer error: $error"));
-          }
-        },
-      );
+        _accMagnitude = sqrt(linearX * linearX + linearY * linearY + linearZ * linearZ);
+      });
 
-      // Start GPS stream
+      // GPS listener
+      _positionStream?.cancel();
       _positionStream = Geolocator.getPositionStream(
         locationSettings: const LocationSettings(
           accuracy: LocationAccuracy.bestForNavigation,
-          distanceFilter: 0,
+          distanceFilter: 1,
         ),
-      ).listen(
-            (pos) {
-          if (isClosed) return;
+      ).listen((pos) {
+        double gpsKmh = pos.speed * 3.6;
 
-          _gpsSpeed = pos.speed * 3.6; // m/s → km/h
-          _lastGpsUpdate = DateTime.now();
-        },
-        onError: (error) {
-          if (!isClosed) {
-            // Don't stop tracking on GPS errors, just mark as stale
-            _lastGpsUpdate = null;
-          }
-        },
-      );
+        // Sanity checks
+        if (pos.accuracy > 25) return;
+        if (gpsKmh < 0 || gpsKmh > 300) return;
+        if ((gpsKmh - _currentSpeed).abs() > 50) return;
 
-      // Start sensor fusion timer
-      _fusionTimer = Timer.periodic(
-        SpeedConfig.fusionUpdateInterval,
-            (timer) {
-          if (isClosed) {
-            timer.cancel();
-            return;
-          }
+        // If stationary, zero speed
+        if (gpsKmh < 1.0 && _accMagnitude < 0.15) gpsKmh = 0.0;
 
-          // Check if GPS data is stale
-          final gpsStale = _lastGpsUpdate == null ||
-              DateTime.now().difference(_lastGpsUpdate!).inMilliseconds >
-                  SpeedConfig.gpsStaleThresholdMs;
+        // Smooth speed with exponential filter
+        const smoothing = 0.1;
+        _currentSpeed = _currentSpeed * (1 - smoothing) + gpsKmh * smoothing;
 
-          // Compute fused speed
-          double fusedSpeed;
-          if (gpsStale) {
-            // GPS unavailable - use accelerometer prediction
-            fusedSpeed = _currentSpeed +
-                _accMagnitude * SpeedConfig.accelMultiplier;
-          } else {
-            // Combine GPS + accelerometer
-            fusedSpeed = (_gpsSpeed * SpeedConfig.gpsWeight) +
-                (_accMagnitude * SpeedConfig.accelWeight);
-          }
-
-          // Apply Kalman smoothing
-          double filtered = _kalman.filter(fusedSpeed);
-
-          // Detect stationary state
-          if (filtered < SpeedConfig.stationarySpeedThreshold &&
-              _accMagnitude < SpeedConfig.stationaryAccelThreshold) {
-            filtered = 0.0;
-            _kalman.reset();
-          }
-
-          // Clamp to valid range
-          filtered = filtered.clamp(0.0, SpeedConfig.maxSpeed);
-          _currentSpeed = filtered;
-
-          // Emit update
-          if (!isClosed) {
-            add(_SpeedUpdate(_currentSpeed));
-          }
-        },
-      );
+        if (!isClosed) add(_SpeedUpdate(_currentSpeed));
+      });
     } catch (e) {
-      emit(SpeedError("Speed tracking error: $e"));
-      await _cleanup();
+      emit(SpeedError(e.toString()));
     }
   }
 
-  Future<void> _onStopTracking(
-      StopTracking event, Emitter<SpeedState> emit) async {
-    await _cleanup();
+  Future<void> _onStopTracking(StopTracking event, Emitter<SpeedState> emit) async {
+    await _positionStream?.cancel();
+    await _accelStream?.cancel();
+    _currentSpeed = 0;
     emit(SpeedInitial());
   }
 
-  /// Clean up all resources
-  Future<void> _cleanup() async {
-    await _positionStream?.cancel();
-    _positionStream = null;
-
-    await _accelStream?.cancel();
-    _accelStream = null;
-
-    _fusionTimer?.cancel();
-    _fusionTimer = null;
-
-    _currentSpeed = 0.0;
-    _accMagnitude = 0.0;
-    _gpsSpeed = 0.0;
-    _lastGpsUpdate = null;
-    _kalman.reset();
-  }
-
   @override
-  Future<void> close() async {
-    await _cleanup();
+  Future<void> close() {
+    _positionStream?.cancel();
+    _accelStream?.cancel();
     return super.close();
   }
 }
