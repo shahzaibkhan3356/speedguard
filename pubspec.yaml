@@ -51,6 +51,9 @@ dependencies:
   fluttertoast: ^9.0.0
   equatable: ^2.0.7
   rxdart: ^0.28.0
+  flutter_launcher_icons: ^0.14.4
+  google_mobile_ads: ^6.0.0
+  quickalert: ^1.1.0
 
 dev_dependencies:
   flutter_test:

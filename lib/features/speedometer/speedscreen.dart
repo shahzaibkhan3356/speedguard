@@ -1,9 +1,12 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:flutter_bloc/flutter_bloc.dart';
 import 'package:get/get.dart';
 import 'package:just_audio/just_audio.dart';
 import '../../Bloc/SpeedBloc/SpeedBloc.dart';
 import '../../Bloc/SpeedLimitBloc/SpeedLimitBloc.dart';
+import '../../core/widgets/bannerad.dart';
 import '../../core/widgets/speedlimit.dart';
 import '../../core/widgets/speedmeter.dart';
 
@@ -32,10 +35,6 @@ class SpeedPage extends StatelessWidget {
                     child: BlocBuilder<SpeedBloc, SpeedState>(
                       builder: (context, state) {
                         if (state is SpeedUpdated) {
-                          context
-                              .read<SpeedLimitBloc>()
-                              .add(CheckSpeed(state.speedKmh));
-
                           return SpeedometerGauge(
                             value: state.speedKmh,
                             min: 0,
@@ -65,11 +64,13 @@ class SpeedPage extends StatelessWidget {
                 // Speed limit widget
                 const SpeedLimitWidget(),
                 const SizedBox(height: 16),
+
               ],
             ),
           ),
         ),
 
+bottomNavigationBar: AdBannerWidget(),
       ),
     );
 

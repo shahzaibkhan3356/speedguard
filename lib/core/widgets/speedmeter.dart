@@ -142,6 +142,7 @@ class SpeedometerGauge extends StatelessWidget {
                     style: valueStyle ??
                         Theme.of(context).textTheme.displaySmall?.copyWith(
                           fontWeight: FontWeight.bold,
+                          fontSize: 50
                         ),
                   ),
                   if (units != null)
