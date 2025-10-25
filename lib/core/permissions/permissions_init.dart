@@ -1,9 +1,9 @@
 import 'package:flutter/material.dart';
 import 'package:fluttertoast/fluttertoast.dart';
+import 'package:geolocator/geolocator.dart';
 import 'package:get/get.dart';
 import 'package:permission_handler/permission_handler.dart';
-import 'package:geolocator/geolocator.dart';
-import 'package:speedguard/features/speedometer/speedscreen.dart';
+import 'package:speedguard/features/dashboard/dashboard.dart';
 
 /// Permission initialization screen
 ///
@@ -124,7 +124,7 @@ class _PermissionInitializerState extends State<PermissionInitializer>
       await Future.delayed(const Duration(milliseconds: 300));
 
       if (mounted) {
-        Get.offAll(() => const SpeedPage());
+        Get.offAll(() => const DashboardPage());
       }
     }
   }
@@ -140,7 +140,7 @@ class _PermissionInitializerState extends State<PermissionInitializer>
         title: const Text("Permissions Required"),
         content: const Text(
           "Location, audio, and notification permissions are required to use this app.\n\n"
-              "Please enable them in settings to continue.",
+          "Please enable them in settings to continue.",
         ),
         actions: [
           TextButton(
@@ -239,24 +239,23 @@ class _PermissionInitializerState extends State<PermissionInitializer>
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      backgroundColor: Colors.black,
+      backgroundColor: const Color(0xFF12151C),
       body: Center(
         child: _checking
             ? Column(
-          mainAxisAlignment: MainAxisAlignment.center,
-          children: const [
-            CircularProgressIndicator(color: Colors.white),
-
-          ],
-        )
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: const [
+                  CircularProgressIndicator(color: Colors.white),
+                ],
+              )
             : const Text(
-          "Ready!",
-          style: TextStyle(
-            color: Colors.white,
-            fontSize: 24,
-            fontWeight: FontWeight.bold,
-          ),
-        ),
+                "Ready!",
+                style: TextStyle(
+                  color: Colors.white,
+                  fontSize: 24,
+                  fontWeight: FontWeight.bold,
+                ),
+              ),
       ),
     );
   }

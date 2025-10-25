@@ -2,8 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:get/get.dart';
 import 'package:lottie/lottie.dart';
 import 'package:speedguard/core/permissions/permissions_init.dart';
-import 'package:speedguard/core/theme/Apptheme.dart';
-import 'package:speedguard/features/speedometer/speedscreen.dart';
+import 'package:speedguard/core/theme/AppTheme.dart';
 
 class SplashScreen extends StatefulWidget {
   const SplashScreen({super.key});
@@ -15,33 +14,55 @@ class SplashScreen extends StatefulWidget {
 class _SplashScreenState extends State<SplashScreen> {
   @override
   void initState() {
-    // TODO: implement initState
     super.initState();
-    Future.delayed(Duration(seconds: 4),() {
-      Get.offAll(PermissionInitializer());
-    },);
+    Future.delayed(
+      const Duration(seconds: 4),
+      () => Get.offAll(() => const PermissionInitializer()),
+    );
   }
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-body: Center(
-  child: Column(
-    mainAxisAlignment: MainAxisAlignment.center,
-    crossAxisAlignment: CrossAxisAlignment.center,
-    children: [
-   Lottie.asset(
+      backgroundColor: const Color(0xFF12151C), // 🟩 Same dark tone
+      body: Center(
+        child: Column(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            // ====== LOTTIE ANIMATION ======
+            Lottie.asset(
+              'assets/Speedometer.json',
+              width: 220,
+              height: 220,
+              fit: BoxFit.fill,
+            ),
+            const SizedBox(height: 50),
 
-     'assets/Speedometer.json',
-     width: 200,
-     height: 200,
-     fit: BoxFit.fill,),
-      Container(
-        height: 50,
+            // ====== APP TITLE ======
+            Text(
+              "Speed Guard",
+              style: AppTheme.heading1.copyWith(
+                color: Colors.tealAccent, // 🟩 Accent like in SettingsPage
+                fontWeight: FontWeight.w700,
+                letterSpacing: 1.2,
+              ),
+            ),
+
+            const SizedBox(height: 10),
+
+            // ====== SUBTEXT / TAGLINE ======
+            Text(
+              "Drive Smart. Stay Safe.",
+              style: AppTheme.body.copyWith(
+                color: Colors.white60,
+                fontSize: 14,
+              ),
+            ),
+
+            const SizedBox(height: 80),
+          ],
+        ),
       ),
-      Text("Speed Guard",style: AppTheme.heading1,)
-    ],
-  ),
-),
     );
   }
 }
