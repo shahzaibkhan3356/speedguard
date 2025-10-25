@@ -31,6 +31,15 @@ class UpdateSpeedLimit extends SpeedEvent {
   UpdateSpeedLimit(this.speedLimit);
 }
 
+// Internal events for decoupling streams
+class _PredictSpeed extends SpeedEvent {}
+
+class _CorrectSpeed extends SpeedEvent {
+  final double gpsSpeed;
+  final double gpsAcc;
+  _CorrectSpeed(this.gpsSpeed, this.gpsAcc);
+}
+
 /// ---------- STATE ----------
 @immutable
 class SpeedState {
@@ -99,23 +108,34 @@ class SpeedState {
 
 /// ---------- BLOC ----------
 class SpeedBloc extends Bloc<SpeedEvent, SpeedState> {
-  // --- Core variables ---
+  // Core filters (Kalman)
   double _estimate = 0.0;
-  double _errorCov = 1.0;
-  double _integratedSpeed = 0.0;
-  DateTime? _lastAccelTime;
-  double _lastAccel = 9.81;
-  double _lastGyro = 0.0;
+  double _errorCov = 1.0; // P_k-1: Initial uncertainty
+  double _predictedSpeed = 0.0;
+  DateTime _lastUpdate = DateTime.now();
+  final double _motionThreshold =
+      0.2; // m/s² threshold for detecting absolute motion
 
-  // --- Streams ---
+  // Sensors / Subscriptions
+  final AccelerometerEvent _lastAccel = AccelerometerEvent(
+    0,
+    0,
+    0,
+    DateTime.now(),
+  );
+  GyroscopeEvent _lastGyro = GyroscopeEvent(0, 0, 0, DateTime.now());
   StreamSubscription<Position>? _gpsSub;
-  StreamSubscription<UserAccelerometerEvent>? _accelSub;
+  StreamSubscription<AccelerometerEvent>? _accelSub;
   StreamSubscription<GyroscopeEvent>? _gyroSub;
 
-  // --- Alerts ---
+  // Alerts
   final AudioPlayer _audioPlayer = AudioPlayer();
-  Timer? _alertTimer;
   bool _alertActive = false;
+
+  // Last GPS measurement used for Correction step
+  double _lastGpsSpeed = 0.0;
+  double _lastGpsAcc = 999.0;
+  int _lastGpsStrength = 0;
 
   SpeedBloc()
     : super(
@@ -143,20 +163,248 @@ class SpeedBloc extends Bloc<SpeedEvent, SpeedState> {
     on<ToggleSpeedUnit>(_onToggleUnit);
     on<UpdateSpeedLimit>(_onUpdateLimit);
 
+    // Internal handlers for the decoupled streams
+    on<_PredictSpeed>(_onPredictSpeed); // Driven by IMU stream
+    on<_CorrectSpeed>(_onCorrectSpeed); // Driven by GPS stream
+
     add(LoadPreferences());
   }
 
+  // ---------- Lifecycle ----------
   @override
   Future<void> close() async {
     await _gpsSub?.cancel();
     await _accelSub?.cancel();
     await _gyroSub?.cancel();
-    _alertTimer?.cancel();
     await _audioPlayer.dispose();
     return super.close();
   }
 
-  // ---------- Preferences ----------
+  // ---------- Start/Stop Handlers ----------
+  void _onStart(StartMeasurement e, Emitter<SpeedState> emit) async {
+    emit(state.copyWith(isMeasuring: true));
+    _startGps();
+    _startSensors();
+    debugPrint('[SpeedBloc] Started measurement');
+  }
+
+  void _onStop(StopMeasurement e, Emitter<SpeedState> emit) async {
+    await _gpsSub?.cancel();
+    await _accelSub?.cancel();
+    await _gyroSub?.cancel();
+    await _stopAlert();
+    // Reset filters on stop
+    _estimate = 0.0;
+    _errorCov = 1.0;
+    _predictedSpeed = 0.0;
+    emit(
+      state.copyWith(isMeasuring: false, filteredSpeed: 0.0, isMoving: false),
+    );
+    debugPrint('[SpeedBloc] Stopped measurement');
+  }
+
+  // ---------- GPS (Correction) ----------
+  void _startGps() {
+    // 1. GPS setup
+    _gpsSub =
+        Geolocator.getPositionStream(
+          locationSettings: const LocationSettings(
+            accuracy: LocationAccuracy.bestForNavigation,
+            distanceFilter: 0, // Receive all updates
+          ),
+        ).listen((pos) {
+          final gpsSpeed = (pos.speed.isNaN || pos.speed.isInfinite)
+              ? 0.0
+              : pos.speed * 3.6; // m/s to km/h
+
+          // Dispatch the correction event
+          add(_CorrectSpeed(gpsSpeed, pos.accuracy));
+        });
+  }
+
+  // ---------- Sensors (Prediction) ----------
+  void _startSensors() {
+    // 1. Subscribe to Accel (high-frequency) to drive the prediction loop
+    _accelSub = accelerometerEventStream(
+      samplingPeriod: SensorInterval.uiInterval,
+    ).listen((e) => add(_PredictSpeed()));
+
+    // 2. Subscribe to Gyro for stillness check and motion classification
+    _gyroSub = gyroscopeEventStream(
+      samplingPeriod: SensorInterval.uiInterval,
+    ).listen((e) => _lastGyro = e);
+  }
+
+  // ---------- Core Motion Logic ----------
+
+  /// Uses IMU to strictly check if the device is stationary.
+  bool get _isAbsolutelyStill {
+    final accelMag = math.sqrt(
+      _lastAccel.x * _lastAccel.x +
+          _lastAccel.y * _lastAccel.y +
+          _lastAccel.z * _lastAccel.z,
+    );
+    final gyroMag = math.sqrt(
+      _lastGyro.x * _lastGyro.x +
+          _lastGyro.y * _lastGyro.y +
+          _lastGyro.z * _lastGyro.z,
+    );
+
+    // Check if linear motion (accel - gravity) and rotation are minimal
+    return (accelMag - 9.81).abs() < _motionThreshold && gyroMag < 0.1;
+  }
+
+  // ----------------------------------------------------
+  // 🚀 Prediction Handler (IMU-Driven - FAST)
+  // ----------------------------------------------------
+  void _onPredictSpeed(_PredictSpeed e, Emitter<SpeedState> emit) {
+    if (!state.isMeasuring) return;
+
+    final now = DateTime.now();
+    final dt = now.difference(_lastUpdate).inMilliseconds / 1000.0;
+    _lastUpdate = now;
+
+    // 1. STRICT ZERO-SPEED LOCK: Override if the IMU detects no motion.
+    if (_isAbsolutelyStill) {
+      _estimate = 0.0;
+      _predictedSpeed = 0.0;
+      _errorCov = 1.0; // Reset P to max uncertainty for fast startup
+    } else {
+      // 2. Dead Reckoning (Prediction)
+      // Estimate change in speed using linear acceleration
+      final accelMag = math.sqrt(
+        _lastAccel.x * _lastAccel.x +
+            _lastAccel.y * _lastAccel.y +
+            _lastAccel.z * _lastAccel.z,
+      );
+      final linearAccel = (accelMag - 9.81).clamp(-4.0, 4.0); // Remove gravity
+      _predictedSpeed = (_predictedSpeed + linearAccel * 3.6 * dt).clamp(
+        0,
+        400,
+      );
+
+      // 3. Adaptive Q Boost for Responsiveness
+      final qBoost =
+          linearAccel.abs() * 0.2; // Increase Q if accelerating/decelerating
+
+      // 4. Update Filter using IMU prediction (Prediction Step Only)
+      // Use a high R to reduce trust in the IMU speed alone.
+      _updateKalman(_predictedSpeed, _lastGpsAcc, Q_boost: qBoost);
+    }
+
+    // 5. State Update (for smooth UI rendering)
+    final moving = _estimate > 1.5;
+    final over = _estimate > state.speedLimit;
+
+    // Recalculate isLinearMotion using the latest data
+    final accelMagForLinear = math.sqrt(
+      _lastAccel.x * _lastAccel.x +
+          _lastAccel.y * _lastAccel.y +
+          _lastAccel.z * _lastAccel.z,
+    );
+    final isLinear = _isLinearMotion(accelMagForLinear, _lastGyro);
+
+    _handleAlert(over, moving);
+
+    emit(
+      state.copyWith(
+        filteredSpeed: _estimate,
+        isLinearMotion: isLinear,
+        isMoving: moving,
+        overSpeed: over,
+        // GPS related states only updated in _onCorrectSpeed
+        confidenceLevel: _calcConfidence(_lastGpsStrength, isLinear),
+      ),
+    );
+  }
+
+  // ----------------------------------------------------
+  // 🧭 Correction Handler (GPS-Driven - SLOW)
+  // ----------------------------------------------------
+  void _onCorrectSpeed(_CorrectSpeed e, Emitter<SpeedState> emit) {
+    if (!state.isMeasuring || _isAbsolutelyStill) return;
+
+    // 1. Store last GPS data
+    _lastGpsSpeed = e.gpsSpeed;
+    _lastGpsAcc = e.gpsAcc;
+    _lastGpsStrength = _gpsStrength(e.gpsAcc);
+
+    // 2. Correction Step: Update filter using the GPS measurement
+    // Q_boost is zero here as the prediction step already handled it.
+    _updateKalman(_lastGpsSpeed, _lastGpsAcc, Q_boost: 0.0);
+
+    // 3. State Update for GPS status
+    emit(
+      state.copyWith(
+        gpsAvailable: true,
+        gpsAccuracy: _lastGpsAcc,
+        gpsStrength: _lastGpsStrength,
+      ),
+    );
+
+    debugPrint(
+      "[Correction] GPS:${_lastGpsSpeed.toStringAsFixed(2)} "
+      "Fused:${_estimate.toStringAsFixed(2)} "
+      "Acc:${_lastGpsAcc.toStringAsFixed(1)}m "
+      "Str:$_lastGpsStrength%",
+    );
+  }
+
+  // ---------- Kalman Utilities ----------
+
+  void _updateKalman(double meas, double acc, {required double Q_boost}) {
+    // 1. Prediction (Process Covariance)
+    final qBase = 0.05;
+    final Q = qBase + Q_boost;
+    _errorCov += Q;
+
+    // 2. Adaptive R (Measurement Noise)
+    final R = _adaptiveR(acc);
+
+    // 3. Kalman Gain
+    final K = _errorCov / (_errorCov + R);
+
+    // 4. Correction
+    _estimate += K * (meas - _estimate);
+
+    // 5. Update Covariance
+    _errorCov *= (1 - K);
+
+    _estimate = _estimate.clamp(0, 400);
+  }
+
+  double _adaptiveR(double acc) {
+    // R (Measurement Noise) is inversely related to GPS accuracy.
+    if (acc < 3.0) return 0.2; // High confidence (trust GPS correction a lot)
+    if (acc < 6.0) return 0.8;
+    if (acc < 10.0) return 3.0;
+    if (acc < 20.0) return 8.0;
+    return 15.0; // Low confidence (trust IMU prediction more)
+  }
+
+  // ---------- Helper Methods (Intact) ----------
+
+  int _gpsStrength(double acc) {
+    if (acc <= 5) return 100;
+    if (acc <= 10) return 90;
+    if (acc <= 15) return 75;
+    if (acc <= 25) return 50;
+    if (acc <= 50) return 25;
+    return 10;
+  }
+
+  bool _isLinearMotion(double accelMag, GyroscopeEvent g) {
+    final gyroMag = math.sqrt(g.x * g.x + g.y * g.y + g.z * g.z);
+    return (accelMag - 9.81).abs() > 0.15 && gyroMag < 0.3;
+  }
+
+  int _calcConfidence(int gpsStrength, bool isLinear) {
+    int conf = gpsStrength;
+    if (!isLinear) conf = (conf * 0.5).toInt();
+    return conf.clamp(0, 100);
+  }
+
+  // ---------- Toggles and Settings (Intact) ----------
   Future<void> _onLoadPrefs(LoadPreferences e, Emitter<SpeedState> emit) async {
     final prefs = await SharedPreferences.getInstance();
     emit(
@@ -169,176 +417,59 @@ class SpeedBloc extends Bloc<SpeedEvent, SpeedState> {
     );
   }
 
-  // ---------- Start ----------
-  void _onStart(StartMeasurement e, Emitter<SpeedState> emit) async {
-    emit(state.copyWith(isMeasuring: true));
-
-    _startGps();
-    _startSensors();
-
-    debugPrint('[SpeedBloc] Measurement started');
+  Future<void> _onToggleSound(ToggleSound e, Emitter<SpeedState> emit) async {
+    final prefs = await SharedPreferences.getInstance();
+    final newVal = !state.soundEnabled;
+    await prefs.setBool('soundEnabled', newVal);
+    emit(state.copyWith(soundEnabled: newVal));
+    if (!newVal) await _stopSound();
   }
 
-  // ---------- Stop ----------
-  void _onStop(StopMeasurement e, Emitter<SpeedState> emit) async {
-    await _gpsSub?.cancel();
-    await _accelSub?.cancel();
-    await _gyroSub?.cancel();
-    _stopAlert();
-    emit(state.copyWith(isMeasuring: false));
-    debugPrint('[SpeedBloc] Measurement stopped');
+  Future<void> _onToggleVibration(
+    ToggleVibration e,
+    Emitter<SpeedState> emit,
+  ) async {
+    final prefs = await SharedPreferences.getInstance();
+    final newVal = !state.vibrationEnabled;
+    await prefs.setBool('vibrationEnabled', newVal);
+    emit(state.copyWith(vibrationEnabled: newVal));
+    if (!newVal) await _stopVibration();
   }
 
-  // ---------- GPS Stream ----------
-  void _startGps() async {
-    final permission = await Geolocator.requestPermission();
-    if (permission == LocationPermission.deniedForever) {
-      debugPrint('[GPS] Permission denied forever.');
-      return;
-    }
-
-    _gpsSub =
-        Geolocator.getPositionStream(
-          locationSettings: const LocationSettings(
-            accuracy: LocationAccuracy.high,
-            distanceFilter: 0,
-          ),
-        ).listen((pos) {
-          final gpsSpeed = (pos.speed.isNaN || pos.speed.isInfinite)
-              ? 0.0
-              : pos.speed * 3.6;
-
-          final gpsAcc = pos.accuracy;
-          final gpsStr = _gpsStrength(gpsAcc);
-
-          _processFusion(gpsSpeed, gpsAcc, gpsStr);
-        }, onError: (e) => debugPrint('[GPS] Error: $e'));
+  Future<void> _onToggleUnit(
+    ToggleSpeedUnit e,
+    Emitter<SpeedState> emit,
+  ) async {
+    final prefs = await SharedPreferences.getInstance();
+    final newUnit = !state.useMph;
+    final newLimit = newUnit
+        ? _kmhToMph(state.speedLimit)
+        : _mphToKmh(state.speedLimit);
+    await prefs.setBool('useMph', newUnit);
+    await prefs.setDouble('speedLimit', newLimit);
+    emit(state.copyWith(useMph: newUnit, speedLimit: newLimit));
   }
 
-  // ---------- Sensor Streams ----------
-  void _startSensors() {
-    _accelSub = userAccelerometerEventStream().listen((a) {
-      _lastAccel = math.sqrt(a.x * a.x + a.y * a.y + a.z * a.z);
-      _integrateImuSpeed();
-    });
-
-    _gyroSub = gyroscopeEventStream().listen((g) {
-      _lastGyro = math.sqrt(g.x * g.x + g.y * g.y + g.z * g.z);
-    });
+  Future<void> _onUpdateLimit(
+    UpdateSpeedLimit e,
+    Emitter<SpeedState> emit,
+  ) async {
+    final prefs = await SharedPreferences.getInstance();
+    final limitKmh = state.useMph ? _mphToKmh(e.speedLimit) : e.speedLimit;
+    await prefs.setDouble('speedLimit', limitKmh);
+    emit(state.copyWith(speedLimit: limitKmh));
   }
 
-  // ---------- Sensor Integration ----------
-  void _integrateImuSpeed() {
-    final now = DateTime.now();
-    final dt = _lastAccelTime == null
-        ? 0.1
-        : now.difference(_lastAccelTime!).inMilliseconds / 1000.0;
-    _lastAccelTime = now;
+  double _kmhToMph(double kmh) => kmh * 0.621371;
+  double _mphToKmh(double mph) => mph / 0.621371;
 
-    final linAccel = (_lastAccel - 9.81).clamp(-3, 3);
-    _integratedSpeed += linAccel * 3.6 * dt;
-    _integratedSpeed = _integratedSpeed.clamp(0, 300);
-  }
-
-  // ---------- Adaptive Fusion ----------
-  void _processFusion(double gpsSpeed, double gpsAcc, int gpsStrength) {
-    final isLinear = _isLinearMotion(_lastAccel, _lastGyro);
-    final fusedSpeed = _fuseSpeeds(gpsSpeed, _integratedSpeed, gpsStrength);
-    _updateKalman(fusedSpeed, gpsAcc);
-
-    final moving = _estimate > 1.5;
-    final over = _estimate > state.speedLimit;
-
-    _handleAlert(over, moving);
-
-    emit(
-      state.copyWith(
-        filteredSpeed: _estimate,
-        gpsAccuracy: gpsAcc,
-        gpsAvailable: true,
-        gpsStrength: gpsStrength,
-        isLinearMotion: isLinear,
-        isMoving: moving,
-        overSpeed: over,
-        confidenceLevel: _calcConfidence(gpsStrength, isLinear),
-      ),
-    );
-
-    // 🔍 Debug output
-    debugPrint(
-      '[GPS] Speed: ${gpsSpeed.toStringAsFixed(2)} km/h, '
-      'Acc: ${gpsAcc.toStringAsFixed(1)}m, '
-      'Strength: $gpsStrength%, '
-      'Fused: ${_estimate.toStringAsFixed(2)} km/h',
-    );
-  }
-
-  // ---------- Fusion Logic ----------
-  double _fuseSpeeds(double gps, double imu, int strength) {
-    double wGps, wImu;
-    if (strength >= 80) {
-      wGps = 1.0;
-      wImu = 0.0;
-    } else if (strength >= 50) {
-      wGps = 0.6;
-      wImu = 0.4;
-    } else if (strength >= 20) {
-      wGps = 0.3;
-      wImu = 0.7;
-    } else {
-      wGps = 0.0;
-      wImu = 1.0;
-    }
-    return gps * wGps + imu * wImu;
-  }
-
-  void _updateKalman(double meas, double gpsAcc) {
-    final R = _adaptiveR(gpsAcc);
-    final Q = gpsAcc > 15 ? 0.3 : 0.1;
-    _errorCov += Q;
-    final K = _errorCov / (_errorCov + R);
-    _estimate += K * (meas - _estimate);
-    _errorCov *= (1 - K);
-    _estimate = _estimate.clamp(0, 300);
-  }
-
-  // ---------- Utils ----------
-  double _adaptiveR(double acc) {
-    if (acc < 5) return 0.3;
-    if (acc < 10) return 1.5;
-    if (acc < 20) return 3;
-    if (acc < 40) return 5;
-    return 8;
-  }
-
-  int _gpsStrength(double acc) {
-    if (acc <= 5) return 100;
-    if (acc <= 10) return 90;
-    if (acc <= 15) return 75;
-    if (acc <= 25) return 50;
-    if (acc <= 50) return 25;
-    return 0;
-  }
-
-  bool _isLinearMotion(double accel, double gyro) =>
-      (accel - 9.81).abs() > 0.15 && gyro < 0.3;
-
-  int _calcConfidence(int gpsStrength, bool isLinear) {
-    int conf = gpsStrength;
-    if (!isLinear) conf = (conf * 0.5).toInt();
-    return conf.clamp(0, 100);
-  }
-
+  // ---------- Alerts (Intact) ----------
   Future<void> _handleAlert(bool over, bool moving) async {
-    // Instant, frame-by-frame check instead of periodic timer
     if (over && moving) {
       if (!_alertActive) {
         _alertActive = true;
-
-        // Respect toggles every frame
         if (state.soundEnabled) await _startSound();
         if (state.vibrationEnabled) await _startVibration();
-
         _showAlertSnackbar();
       }
     } else if (_alertActive) {
@@ -347,15 +478,14 @@ class SpeedBloc extends Bloc<SpeedEvent, SpeedState> {
   }
 
   void _showAlertSnackbar() {
-    // Close any older snackbar to avoid stacking
     Get.closeAllSnackbars();
     Get.snackbar(
       "Speed Limit 🚨",
-      "You're over the limit! ${_estimate.toStringAsFixed(1)} km/h",
+      "Over Speed! ${_estimate.toStringAsFixed(1)} km/h",
       snackPosition: SnackPosition.BOTTOM,
       backgroundColor: Colors.red.withOpacity(0.9),
       colorText: Colors.white,
-      duration: const Duration(seconds: 1),
+      duration: const Duration(milliseconds: 1500),
       icon: const Icon(Icons.warning_amber_rounded, color: Colors.white),
     );
   }
@@ -369,8 +499,9 @@ class SpeedBloc extends Bloc<SpeedEvent, SpeedState> {
   }
 
   Future<void> _startVibration() async {
-    if (await Vibration.hasVibrator()) {
-      Vibration.vibrate(pattern: [0, 600, 300], repeat: 1);
+    if (await Vibration.hasVibrator() ?? false) {
+      // Use shorter, repeated pattern for alerts
+      Vibration.vibrate(pattern: [0, 300, 100, 300], repeat: 0);
     }
   }
 
@@ -388,59 +519,7 @@ class SpeedBloc extends Bloc<SpeedEvent, SpeedState> {
 
   Future<void> _stopVibration() async {
     try {
-      if (await Vibration.hasVibrator()) {
-        Vibration.cancel();
-      }
+      if (await Vibration.hasVibrator() ?? false) Vibration.cancel();
     } catch (_) {}
   }
-
-  Future<void> _onToggleSound(ToggleSound e, Emitter<SpeedState> emit) async {
-    final prefs = await SharedPreferences.getInstance();
-    final newValue = !state.soundEnabled;
-    await prefs.setBool('soundEnabled', newValue);
-    emit(state.copyWith(soundEnabled: newValue));
-
-    // If sound was just disabled, stop it now
-    if (!newValue) await _stopSound();
-  }
-
-  Future<void> _onToggleVibration(
-    ToggleVibration e,
-    Emitter<SpeedState> emit,
-  ) async {
-    final prefs = await SharedPreferences.getInstance();
-    final newValue = !state.vibrationEnabled;
-    await prefs.setBool('vibrationEnabled', newValue);
-    emit(state.copyWith(vibrationEnabled: newValue));
-
-    // If vibration was just disabled, stop it now
-    if (!newValue) await _stopVibration();
-  }
-
-  Future<void> _onToggleUnit(
-    ToggleSpeedUnit e,
-    Emitter<SpeedState> emit,
-  ) async {
-    final prefs = await SharedPreferences.getInstance();
-    final newUnit = !state.useMph;
-    final newLimit = newUnit
-        ? _kmhToMph(state.speedLimit)
-        : _mphToKmh(state.speedLimit);
-    prefs.setBool('useMph', newUnit);
-    prefs.setDouble('speedLimit', newLimit);
-    emit(state.copyWith(useMph: newUnit, speedLimit: newLimit));
-  }
-
-  Future<void> _onUpdateLimit(
-    UpdateSpeedLimit e,
-    Emitter<SpeedState> emit,
-  ) async {
-    final prefs = await SharedPreferences.getInstance();
-    final limitKmh = state.useMph ? _mphToKmh(e.speedLimit) : e.speedLimit;
-    prefs.setDouble('speedLimit', limitKmh);
-    emit(state.copyWith(speedLimit: limitKmh));
-  }
-
-  double _kmhToMph(double kmh) => kmh * 0.621371;
-  double _mphToKmh(double mph) => mph / 0.621371;
 }

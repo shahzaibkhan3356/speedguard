@@ -55,6 +55,7 @@ dependencies:
   google_mobile_ads: ^6.0.0
   quickalert: ^1.1.0
   wakelock_plus: ^1.4.0
+  location: ^8.0.1
 
 dev_dependencies:
   flutter_test:
