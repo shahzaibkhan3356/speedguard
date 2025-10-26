@@ -1,4 +1,5 @@
 import 'dart:math' as math;
+
 import 'package:flutter/material.dart';
 
 /// A customizable speedometer / gauge widget with segments, ticks, labels, and an animated needle.
@@ -119,12 +120,12 @@ class SpeedometerGauge extends StatelessWidget {
               sweepAngle: _deg2rad(sweepAngleDeg),
               needleColor: needleColor ?? Theme.of(context).colorScheme.primary,
               tickColor: tickColor ?? Theme.of(context).colorScheme.outline,
-              labelStyle: labelStyle ??
+              labelStyle:
+                  labelStyle ??
                   Theme.of(context).textTheme.bodySmall?.copyWith(
-                    color: Theme.of(context)
-                        .colorScheme
-                        .onSurface
-                        .withOpacity(0.8),
+                    color: Theme.of(
+                      context,
+                    ).colorScheme.onSurface.withOpacity(0.8),
                   ),
               showTicks: showTicks,
               majorTickCount: majorTickCount,
@@ -134,22 +135,22 @@ class SpeedometerGauge extends StatelessWidget {
               child: Column(
                 mainAxisSize: MainAxisSize.min,
                 children: [
-                  Container(
-                    height: 130,
-                  ),
+                  Container(height: 130),
                   Text(
-                    value.toStringAsFixed(0),
-                    style: valueStyle ??
+                    value.toStringAsFixed(1),
+                    style:
+                        valueStyle ??
                         Theme.of(context).textTheme.displaySmall?.copyWith(
                           fontWeight: FontWeight.bold,
-                          fontSize: 50
+                          fontSize: 50,
                         ),
                   ),
                   if (units != null)
                     Text(
                       units!,
                       style: Theme.of(context).textTheme.labelLarge?.copyWith(
-                        color: Theme.of(context).hintColor,fontSize: 15
+                        color: Theme.of(context).hintColor,
+                        fontSize: 15,
                       ),
                     ),
                 ],

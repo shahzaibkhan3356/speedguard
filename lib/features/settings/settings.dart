@@ -81,6 +81,7 @@ class _SettingsPageState extends State<SettingsPage> {
                         SizedBox(
                           width: 70,
                           child: TextField(
+                            maxLength: 3,
                             controller: _controller,
                             keyboardType: TextInputType.number,
                             style: const TextStyle(
@@ -88,6 +89,7 @@ class _SettingsPageState extends State<SettingsPage> {
                               fontSize: 18,
                             ),
                             decoration: const InputDecoration(
+                              counterText: '',
                               border: InputBorder.none,
                             ),
                             onSubmitted: (value) {
@@ -114,8 +116,8 @@ class _SettingsPageState extends State<SettingsPage> {
                     ),
                   ),
                   const SizedBox(height: 6),
-                  const Text(
-                    "Set the speed limit for alerts (1–300 km/h)",
+                  Text(
+                    "Set the speed limit for alerts  (1–240 ${state.useMph ? "mph" : "km/h"})",
                     style: TextStyle(color: Colors.white38, fontSize: 12),
                   ),
                   const SizedBox(height: 24),
