@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_bloc/flutter_bloc.dart';
@@ -12,14 +14,30 @@ import 'features/splash/splash.dart';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
-  await MobileAds.instance.initialize();
-  await WakelockPlus.enable();
-  await SystemChrome.setPreferredOrientations([
-    DeviceOrientation.portraitUp,
-    // DeviceOrientation.portraitDown, // Uncomment if you want upside-down portrait
-  ]);
-  await SharedPreferences.getInstance(); // ensure ready
+
+  // Only the essential system lock should block UI.
+  await SystemChrome.setPreferredOrientations([DeviceOrientation.portraitUp]);
+
   runApp(const MyApp());
+
+  // 🔥 Lazy-load heavy async stuff AFTER first frame:
+  WidgetsBinding.instance.addPostFrameCallback((_) async {
+    unawaited(_initializeBackgroundServices());
+  });
+}
+
+/// Background async setup — won’t block UI anymore
+Future<void> _initializeBackgroundServices() async {
+  try {
+    await Future.wait([
+      MobileAds.instance.initialize(),
+      WakelockPlus.enable(),
+      SharedPreferences.getInstance(),
+    ]);
+    debugPrint('[Startup] Background services initialized.');
+  } catch (e) {
+    debugPrint('[Startup Error] $e');
+  }
 }
 
 class MyApp extends StatelessWidget {
@@ -29,8 +47,8 @@ class MyApp extends StatelessWidget {
   Widget build(BuildContext context) {
     return MultiBlocProvider(
       providers: [
-        BlocProvider(create: (_) => SpeedBloc()..add(StartMeasurement())),
-        BlocProvider(create: (_) => ThemeCubit()), // ✅ loads saved theme
+        BlocProvider(create: (_) => SpeedCubit()),
+        BlocProvider(create: (_) => ThemeCubit()),
       ],
       child: BlocBuilder<ThemeCubit, ThemeData>(
         builder: (context, theme) {

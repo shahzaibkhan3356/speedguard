@@ -137,7 +137,7 @@ class SpeedometerGauge extends StatelessWidget {
                 children: [
                   Container(height: 130),
                   Text(
-                    value.toStringAsFixed(1),
+                    value.toStringAsFixed(0),
                     style:
                         valueStyle ??
                         Theme.of(context).textTheme.displaySmall?.copyWith(

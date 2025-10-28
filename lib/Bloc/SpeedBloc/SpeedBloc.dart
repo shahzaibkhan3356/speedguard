@@ -1,55 +1,12 @@
 import 'dart:async';
+import 'dart:developer';
 import 'dart:math' as math;
 
 import 'package:bloc/bloc.dart';
-import 'package:flutter/material.dart';
 import 'package:geolocator/geolocator.dart';
-import 'package:get/get.dart';
-import 'package:just_audio/just_audio.dart';
 import 'package:sensors_plus/sensors_plus.dart';
 import 'package:shared_preferences/shared_preferences.dart';
-import 'package:vibration/vibration.dart';
 
-// --- CONSTANTS FOR PROFESSIONAL FILTERING ---
-const double _STILL_ACCEL_THRESHOLD =
-    0.5; // m/s^2 (Tolerance for linear movement)
-const double _STILL_GYRO_THRESHOLD = 0.05; // rad/s (Tolerance for rotation)
-const double _EMA_ALPHA = 0.9;
-
-/// ================= EVENTS =================
-@immutable
-abstract class SpeedEvent {}
-
-class StartMeasurement extends SpeedEvent {}
-
-class StopMeasurement extends SpeedEvent {}
-
-class LoadPreferences extends SpeedEvent {}
-
-class ToggleSound extends SpeedEvent {}
-
-class ToggleVibration extends SpeedEvent {}
-
-class ToggleSpeedUnit extends SpeedEvent {}
-
-class UpdateSpeedLimit extends SpeedEvent {
-  final double speedLimit;
-  UpdateSpeedLimit(this.speedLimit);
-}
-
-class GpsServiceToggled extends SpeedEvent {
-  final bool isEnabled;
-  GpsServiceToggled(this.isEnabled);
-}
-
-// NEW: Event to carry position data from the stream
-class GpsDataReceived extends SpeedEvent {
-  final Position position;
-  GpsDataReceived(this.position);
-}
-
-/// ================= STATE =================
-@immutable
 class SpeedState {
   final bool isMeasuring;
   final double filteredSpeed;
@@ -58,10 +15,12 @@ class SpeedState {
   final bool useMph;
   final double speedLimit;
   final bool overSpeed;
+  final bool isMoving;
   final bool gpsAvailable;
   final double gpsAccuracy;
   final int gpsStrength;
-  final bool gpsServiceEnabled;
+  final bool isLinearMotion;
+  final int confidenceLevel;
 
   const SpeedState({
     required this.isMeasuring,
@@ -71,11 +30,29 @@ class SpeedState {
     required this.useMph,
     required this.speedLimit,
     required this.overSpeed,
+    required this.isMoving,
     required this.gpsAvailable,
     required this.gpsAccuracy,
     required this.gpsStrength,
-    required this.gpsServiceEnabled,
+    required this.isLinearMotion,
+    required this.confidenceLevel,
   });
+
+  factory SpeedState.initial() => const SpeedState(
+    isMeasuring: false,
+    filteredSpeed: 0.0,
+    soundEnabled: true,
+    vibrationEnabled: true,
+    useMph: false,
+    speedLimit: 60.0,
+    overSpeed: false,
+    isMoving: false,
+    gpsAvailable: false,
+    gpsAccuracy: 0.0,
+    gpsStrength: 0,
+    isLinearMotion: false,
+    confidenceLevel: 0,
+  );
 
   SpeedState copyWith({
     bool? isMeasuring,
@@ -85,10 +62,12 @@ class SpeedState {
     bool? useMph,
     double? speedLimit,
     bool? overSpeed,
+    bool? isMoving,
     bool? gpsAvailable,
     double? gpsAccuracy,
     int? gpsStrength,
-    bool? gpsServiceEnabled,
+    bool? isLinearMotion,
+    int? confidenceLevel,
   }) {
     return SpeedState(
       isMeasuring: isMeasuring ?? this.isMeasuring,
@@ -98,323 +77,35 @@ class SpeedState {
       useMph: useMph ?? this.useMph,
       speedLimit: speedLimit ?? this.speedLimit,
       overSpeed: overSpeed ?? this.overSpeed,
+      isMoving: isMoving ?? this.isMoving,
       gpsAvailable: gpsAvailable ?? this.gpsAvailable,
       gpsAccuracy: gpsAccuracy ?? this.gpsAccuracy,
       gpsStrength: gpsStrength ?? this.gpsStrength,
-      gpsServiceEnabled: gpsServiceEnabled ?? this.gpsServiceEnabled,
+      isLinearMotion: isLinearMotion ?? this.isLinearMotion,
+      confidenceLevel: confidenceLevel ?? this.confidenceLevel,
     );
   }
 }
 
-/// ================= BLOC =================
-class SpeedBloc extends Bloc<SpeedEvent, SpeedState> {
-  // Core variables
-  double _filteredSpeed = 0.0;
-  double _lastGpsSpeed = 0.0;
-  double _lastGpsAcc = 15.0;
+class SpeedCubit extends Cubit<SpeedState> {
+  double _estimate = 0.0;
+  double _errorCov = 1.0;
+  double _predictedSpeed = 0.0;
+  DateTime _lastUpdate = DateTime.now();
 
-  // Sensor variables for Zero-Lock
-  double _linearAccelMagnitude = 0.0;
-  double _gyroMagnitude = 0.0;
+  final List<double> _accelHistory = [];
+  final List<double> _gyroHistory = [];
+  static const int _motionWindow = 10;
+
   StreamSubscription<Position>? _gpsSub;
-  StreamSubscription<ServiceStatus>? _gpsServiceSub;
   StreamSubscription<UserAccelerometerEvent>? _accelSub;
   StreamSubscription<GyroscopeEvent>? _gyroSub;
 
-  // Timer for high-frequency state emission (100 ms)
-  Timer? _updateTimer;
-
-  // Alerts
-  final AudioPlayer _audioPlayer = AudioPlayer();
-  bool _alertActive = false;
-
-  SpeedBloc()
-    : super(
-        const SpeedState(
-          isMeasuring: false,
-          filteredSpeed: 0.0,
-          soundEnabled: true,
-          vibrationEnabled: true,
-          useMph: false,
-          speedLimit: 60.0,
-          overSpeed: false,
-          gpsAvailable: false,
-          gpsAccuracy: 0.0,
-          gpsStrength: 0,
-          gpsServiceEnabled: true,
-        ),
-      ) {
-    on<LoadPreferences>(_onLoadPrefs);
-    on<StartMeasurement>(_onStart);
-    on<StopMeasurement>(_onStop);
-    on<ToggleSound>(_onToggleSound);
-    on<ToggleVibration>(_onToggleVibration);
-    on<ToggleSpeedUnit>(_onToggleUnit);
-    on<UpdateSpeedLimit>(_onUpdateLimit);
-    on<GpsServiceToggled>(_onGpsServiceToggled);
-    on<GpsDataReceived>(_onGpsDataReceived); // NEW: Handler for GPS data
-
-    add(LoadPreferences());
+  SpeedCubit() : super(SpeedState.initial()) {
+    _loadPreferences();
   }
 
-  @override
-  Future<void> close() {
-    _gpsSub?.cancel();
-    _gpsServiceSub?.cancel();
-    _accelSub?.cancel();
-    _gyroSub?.cancel();
-    _updateTimer?.cancel();
-    _audioPlayer.dispose();
-    return super.close();
-  }
-
-  // ============ START/STOP ============
-  void _onStart(StartMeasurement e, Emitter<SpeedState> emit) async {
-    _filteredSpeed = 0.0;
-    _lastGpsSpeed = 0.0;
-
-    emit(state.copyWith(isMeasuring: true));
-
-    _startGps(); // Removed 'emit' argument
-    _startSensors();
-    _startGpsServiceListener();
-
-    final initialStatus = await Geolocator.isLocationServiceEnabled();
-    if (!initialStatus) {
-      add(GpsServiceToggled(false));
-    }
-
-    _updateTimer = Timer.periodic(const Duration(milliseconds: 100), (t) {
-      _applyZeroLock();
-
-      emit(
-        state.copyWith(
-          filteredSpeed: _filteredSpeed,
-          overSpeed: _filteredSpeed > state.speedLimit,
-        ),
-      );
-      _handleAlerts();
-    });
-
-    debugPrint("[SpeedBloc] Measurement started");
-  }
-
-  void _onStop(StopMeasurement e, Emitter<SpeedState> emit) async {
-    await _gpsSub?.cancel();
-    await _gpsServiceSub?.cancel();
-    await _accelSub?.cancel();
-    await _gyroSub?.cancel();
-    _updateTimer?.cancel();
-    await _stopAlert();
-
-    _filteredSpeed = 0.0;
-    _lastGpsSpeed = 0.0;
-
-    emit(state.copyWith(isMeasuring: false, filteredSpeed: 0.0));
-    debugPrint("[SpeedBloc] Measurement stopped");
-  }
-
-  // ============ GPS LISTENERS & ALERT ============
-
-  void _startGpsServiceListener() {
-    _gpsServiceSub = Geolocator.getServiceStatusStream().listen((status) {
-      final isEnabled = status == ServiceStatus.enabled;
-      add(GpsServiceToggled(isEnabled));
-    });
-  }
-
-  void _onGpsServiceToggled(GpsServiceToggled e, Emitter<SpeedState> emit) {
-    emit(state.copyWith(gpsServiceEnabled: e.isEnabled));
-
-    if (!e.isEnabled) {
-      _filteredSpeed = 0.0;
-      _lastGpsSpeed = 0.0;
-      _stopAlert();
-
-      emit(
-        state.copyWith(
-          filteredSpeed: 0.0,
-          gpsAvailable: false,
-          gpsAccuracy: 0.0,
-          gpsStrength: 0,
-        ),
-      );
-
-      Get.snackbar(
-        "⚠️ GPS Service Required",
-        "Location services are disabled. Please enable GPS to continue measuring speed.",
-        snackPosition: SnackPosition.BOTTOM,
-        backgroundColor: Colors.red.shade900,
-        colorText: Colors.white,
-        isDismissible: false,
-        duration: const Duration(minutes: 5),
-        mainButton: TextButton(
-          onPressed: () {
-            Geolocator.openLocationSettings();
-          },
-          child: const Text(
-            'Settings',
-            style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold),
-          ),
-        ),
-      );
-    } else {
-      if (Get.isSnackbarOpen) {
-        Get.back();
-      }
-    }
-  }
-
-  // FIX: This method no longer calls emit. It adds an event.
-  void _startGps() async {
-    final permission = await Geolocator.requestPermission();
-    if (permission == LocationPermission.deniedForever) return;
-
-    _gpsSub =
-        Geolocator.getPositionStream(
-          locationSettings: const LocationSettings(
-            accuracy: LocationAccuracy.bestForNavigation,
-            distanceFilter: 0,
-          ),
-        ).listen((pos) {
-          // Stream listener now adds an event, which is the correct BLoC pattern.
-          add(GpsDataReceived(pos));
-        });
-  }
-
-  // NEW: Handler to process GPS data and safely emit state
-  void _onGpsDataReceived(GpsDataReceived e, Emitter<SpeedState> emit) {
-    final pos = e.position;
-
-    // Prevent processing stale data if the service is disabled
-    if (!state.gpsServiceEnabled) return;
-
-    final gpsSpeedKmh = pos.speed.isFinite ? pos.speed * 3.6 : 0.0;
-    final gpsAcc = pos.accuracy;
-    final gpsStr = _gpsStrength(gpsAcc);
-    debugPrint(
-      "[SpeedBloc] GPS Data - Speed: ${gpsSpeedKmh.toStringAsFixed(2)} km/h, Accuracy: ${gpsAcc.toStringAsFixed(2)} m, Strength: $gpsStr%",
-    );
-    _lastGpsSpeed = gpsSpeedKmh;
-    _lastGpsAcc = gpsAcc;
-
-    _applyExponentialSmoothing(gpsSpeedKmh);
-
-    // This emit is now safely within the synchronous scope of the event handler.
-    emit(
-      state.copyWith(
-        gpsAvailable: true,
-        gpsAccuracy: gpsAcc,
-        gpsStrength: gpsStr,
-      ),
-    );
-  }
-
-  // ============ SENSOR & FILTERING LOGIC ============
-  void _startSensors() {
-    _accelSub =
-        userAccelerometerEventStream(
-          samplingPeriod: const Duration(milliseconds: 50),
-        ).listen((a) {
-          _linearAccelMagnitude = math.sqrt(a.x * a.x + a.y * a.y + a.z * a.z);
-        });
-
-    _gyroSub =
-        gyroscopeEventStream(
-          samplingPeriod: const Duration(milliseconds: 50),
-        ).listen((g) {
-          _gyroMagnitude = math.sqrt(g.x * g.x + g.y * g.y + g.z * g.z);
-        });
-  }
-
-  void _applyExponentialSmoothing(double newGpsSpeed) {
-    _filteredSpeed =
-        (_EMA_ALPHA * newGpsSpeed) + ((1 - _EMA_ALPHA) * _filteredSpeed);
-  }
-
-  void _applyZeroLock() {
-    final isStill =
-        _linearAccelMagnitude < _STILL_ACCEL_THRESHOLD &&
-        _gyroMagnitude < _STILL_GYRO_THRESHOLD;
-
-    final gpsIsNearZero = _lastGpsSpeed < 5.0;
-
-    if (isStill && gpsIsNearZero) {
-      _filteredSpeed = 0.0;
-    }
-
-    _filteredSpeed = _filteredSpeed.clamp(0, 240);
-  }
-
-  int _gpsStrength(double acc) {
-    if (acc <= 5) return 100;
-    if (acc <= 10) return 90;
-    if (acc <= 15) return 75;
-    if (acc <= 25) return 50;
-    if (acc <= 50) return 25;
-    return 10;
-  }
-
-  // ============ SPEED LIMIT & PREFS / ALERTS ============
-
-  Future<void> _onUpdateLimit(
-    UpdateSpeedLimit e,
-    Emitter<SpeedState> emit,
-  ) async {
-    final prefs = await SharedPreferences.getInstance();
-    final newLimitKmh = state.useMph ? _mphToKmh(e.speedLimit) : e.speedLimit;
-
-    await prefs.setDouble('speedLimit', newLimitKmh);
-    final newOverSpeed = _filteredSpeed > newLimitKmh;
-
-    emit(state.copyWith(speedLimit: newLimitKmh, overSpeed: newOverSpeed));
-
-    _handleAlerts();
-  }
-
-  Future<void> _handleAlerts() async {
-    final over = _filteredSpeed > state.speedLimit;
-    if (over && !_alertActive) {
-      _alertActive = true;
-
-      Get.snackbar(
-        "Speed Limit 🚨",
-        "Over Speed! ${_filteredSpeed.toStringAsFixed(1)} km/h",
-        snackPosition: SnackPosition.BOTTOM,
-        backgroundColor: Colors.red.withOpacity(0.9),
-        colorText: Colors.white,
-        duration: const Duration(seconds: 2),
-      );
-
-      if (state.soundEnabled) await _startSound();
-      if (state.vibrationEnabled) await _startVibration();
-    } else if (!over && _alertActive) {
-      await _stopAlert();
-    }
-  }
-
-  Future<void> _startSound() async {
-    try {
-      await _audioPlayer.setAsset("assets/alert-33762.mp3");
-      await _audioPlayer.setLoopMode(LoopMode.one);
-      await _audioPlayer.play();
-    } catch (_) {}
-  }
-
-  Future<void> _startVibration() async {
-    if (await Vibration.hasVibrator() ?? false) {
-      Vibration.vibrate(pattern: [0, 500, 300], repeat: 1);
-    }
-  }
-
-  Future<void> _stopAlert() async {
-    _alertActive = false;
-    await _audioPlayer.stop();
-    if (await Vibration.hasVibrator() ?? false) Vibration.cancel();
-  }
-
-  // ============ TOGGLES & UTILITIES (Unchanged) ============
-  Future<void> _onLoadPrefs(LoadPreferences e, Emitter<SpeedState> emit) async {
+  Future<void> _loadPreferences() async {
     final prefs = await SharedPreferences.getInstance();
     emit(
       state.copyWith(
@@ -426,29 +117,154 @@ class SpeedBloc extends Bloc<SpeedEvent, SpeedState> {
     );
   }
 
-  Future<void> _onToggleSound(ToggleSound e, Emitter<SpeedState> emit) async {
+  // ========== START / STOP ==========
+  Future<void> start() async {
+    emit(state.copyWith(isMeasuring: true));
+    _startGps();
+    _startSensors();
+  }
+
+  Future<void> stop() async {
+    await _gpsSub?.cancel();
+    await _accelSub?.cancel();
+    await _gyroSub?.cancel();
+    emit(state.copyWith(isMeasuring: false, filteredSpeed: 0.0));
+  }
+
+  // ========== GPS ==========
+  void _startGps() {
+    _gpsSub =
+        Geolocator.getPositionStream(
+          locationSettings: const LocationSettings(
+            accuracy: LocationAccuracy.bestForNavigation,
+            distanceFilter: 0,
+          ),
+        ).listen((pos) {
+          final gpsSpeed = (pos.speed.isNaN || pos.speed.isInfinite)
+              ? 0.0
+              : pos.speed * 3.6;
+          final gpsAcc = pos.accuracy;
+          final gpsStrength = _gpsStrength(gpsAcc);
+          log(
+            'GPS Speed: $gpsSpeed km/h, Acc: $gpsAcc m, Strength: $gpsStrength%',
+          );
+          _processFusion(gpsSpeed, gpsAcc, gpsStrength);
+        });
+  }
+
+  // ========== SENSORS ==========
+  void _startSensors() {
+    _accelSub = userAccelerometerEventStream().listen((a) {
+      final mag = math.sqrt(a.x * a.x + a.y * a.y + a.z * a.z);
+      _accelHistory.add(mag.abs());
+      if (_accelHistory.length > _motionWindow) _accelHistory.removeAt(0);
+    });
+
+    _gyroSub = gyroscopeEventStream().listen((g) {
+      final mag = math.sqrt(g.x * g.x + g.y * g.y + g.z * g.z);
+      _gyroHistory.add(mag.abs());
+      if (_gyroHistory.length > _motionWindow) _gyroHistory.removeAt(0);
+    });
+  }
+
+  // ========== FUSION ==========
+  void _processFusion(double gpsSpeed, double gpsAcc, int gpsStrength) {
+    final now = DateTime.now();
+    final dt = now.difference(_lastUpdate).inMilliseconds / 1000.0;
+    _lastUpdate = now;
+
+    final linearAccel = _accelHistory.isEmpty
+        ? 0.0
+        : (_accelHistory.last - 9.81).clamp(-4.0, 4.0);
+    _predictedSpeed = (_predictedSpeed + linearAccel * 3.6 * dt).clamp(0, 400);
+
+    final wGps = gpsStrength / 100.0;
+    final wSensor = 1 - wGps;
+    final fused = gpsSpeed * wGps + _predictedSpeed * wSensor;
+
+    _updateKalman(fused, gpsAcc);
+
+    final moving = _estimate > 1.5;
+    final over = _estimate > state.speedLimit;
+    final isLinear = _isLinearMotion();
+
+    emit(
+      state.copyWith(
+        filteredSpeed: _estimate,
+        gpsAccuracy: gpsAcc,
+        gpsStrength: gpsStrength,
+        gpsAvailable: true,
+        isLinearMotion: isLinear,
+        isMoving: moving,
+        overSpeed: over,
+        confidenceLevel: _calcConfidence(gpsStrength, isLinear),
+      ),
+    );
+  }
+
+  // ========== KALMAN ==========
+  void _updateKalman(double meas, double gpsAcc) {
+    final R = _adaptiveR(gpsAcc);
+    final Q = gpsAcc > 15 ? 0.3 : 0.1;
+    _errorCov += Q;
+    final K = _errorCov / (_errorCov + R);
+    _estimate += K * (meas - _estimate);
+    _errorCov *= (1 - K);
+    _estimate = _estimate.clamp(0, 400);
+  }
+
+  double _adaptiveR(double acc) {
+    if (acc < 5) return 0.3;
+    if (acc < 10) return 1.5;
+    if (acc < 20) return 3;
+    if (acc < 40) return 5;
+    return 8;
+  }
+
+  int _gpsStrength(double acc) {
+    if (acc <= 5) return 100;
+    if (acc <= 10) return 90;
+    if (acc <= 15) return 75;
+    if (acc <= 25) return 50;
+    if (acc <= 50) return 25;
+    return 10;
+  }
+
+  bool _isLinearMotion() {
+    final accelAvg = _accelHistory.isEmpty
+        ? 0
+        : _accelHistory.reduce((a, b) => a + b) / _accelHistory.length;
+    final gyroAvg = _gyroHistory.isEmpty
+        ? 0
+        : _gyroHistory.reduce((a, b) => a + b) / _gyroHistory.length;
+
+    const accelThreshold = 0.25;
+    const gyroThreshold = 0.2;
+    return accelAvg > accelThreshold || gyroAvg > gyroThreshold;
+  }
+
+  int _calcConfidence(int gpsStrength, bool isLinear) {
+    int conf = gpsStrength;
+    if (!isLinear) conf = (conf * 0.5).toInt();
+    return conf.clamp(0, 100);
+  }
+
+  // ========== SETTINGS ==========
+  Future<void> toggleSound() async {
     final prefs = await SharedPreferences.getInstance();
     final newVal = !state.soundEnabled;
     await prefs.setBool('soundEnabled', newVal);
     emit(state.copyWith(soundEnabled: newVal));
-    if (!newVal) await _audioPlayer.stop();
   }
 
-  Future<void> _onToggleVibration(
-    ToggleVibration e,
-    Emitter<SpeedState> emit,
-  ) async {
+  Future<void> toggleVibration() async {
     final prefs = await SharedPreferences.getInstance();
     final newVal = !state.vibrationEnabled;
     await prefs.setBool('vibrationEnabled', newVal);
     emit(state.copyWith(vibrationEnabled: newVal));
-    if (!newVal && await Vibration.hasVibrator() ?? false) Vibration.cancel();
   }
 
-  Future<void> _onToggleUnit(
-    ToggleSpeedUnit e,
-    Emitter<SpeedState> emit,
-  ) async {
+  Future<void> toggleUnit() async {
     final prefs = await SharedPreferences.getInstance();
     final newUnit = !state.useMph;
     final newLimit = newUnit
@@ -457,6 +273,13 @@ class SpeedBloc extends Bloc<SpeedEvent, SpeedState> {
     await prefs.setBool('useMph', newUnit);
     await prefs.setDouble('speedLimit', newLimit);
     emit(state.copyWith(useMph: newUnit, speedLimit: newLimit));
+  }
+
+  Future<void> updateSpeedLimit(double newLimit) async {
+    final prefs = await SharedPreferences.getInstance();
+    final limitKmh = state.useMph ? _mphToKmh(newLimit) : newLimit;
+    await prefs.setDouble('speedLimit', limitKmh);
+    emit(state.copyWith(speedLimit: limitKmh));
   }
 
   double _kmhToMph(double kmh) => kmh * 0.621371;

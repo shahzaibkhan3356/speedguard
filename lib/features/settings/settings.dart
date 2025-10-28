@@ -1,7 +1,6 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_bloc/flutter_bloc.dart';
-
-import '../../Bloc/SpeedBloc/SpeedBloc.dart';
+import 'package:speedguard/Bloc/SpeedBloc/SpeedBloc.dart';
 
 class SettingsPage extends StatefulWidget {
   const SettingsPage({super.key});
@@ -12,11 +11,15 @@ class SettingsPage extends StatefulWidget {
 
 class _SettingsPageState extends State<SettingsPage> {
   late TextEditingController _controller;
+  bool _updating = false; // prevent rapid-fire updates
 
   @override
   void initState() {
     super.initState();
-    _controller = TextEditingController();
+    final cubit = context.read<SpeedCubit>();
+    _controller = TextEditingController(
+      text: cubit.state.speedLimit.toInt().toString(),
+    );
   }
 
   @override
@@ -25,37 +28,53 @@ class _SettingsPageState extends State<SettingsPage> {
     super.dispose();
   }
 
+  void _updateLimit(String value) {
+    if (_updating) return;
+    final cubit = context.read<SpeedCubit>();
+    final double? newLimit = double.tryParse(value.trim());
+
+    if (newLimit != null && newLimit > 0 && newLimit <= 240) {
+      _updating = true;
+      cubit.updateSpeedLimit(newLimit);
+      Future.delayed(const Duration(milliseconds: 300), () {
+        _updating = false;
+      });
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
       backgroundColor: const Color(0xFF12151C),
+      appBar: AppBar(
+        title: const Text(
+          "Settings",
+          style: TextStyle(
+            color: Colors.white,
+            fontWeight: FontWeight.bold,
+            fontSize: 22,
+          ),
+        ),
+        backgroundColor: Colors.transparent,
+        centerTitle: true,
+        elevation: 0,
+        automaticallyImplyLeading: false,
+      ),
       body: SafeArea(
         child: SingleChildScrollView(
           padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 24),
           physics: const BouncingScrollPhysics(),
-          child: BlocConsumer<SpeedBloc, SpeedState>(
-            listener: (context, state) {
-              // ✅ Whenever bloc updates, sync controller with speed limit
-              _controller.text = state.speedLimit.toInt().toString();
-            },
+          child: BlocBuilder<SpeedCubit, SpeedState>(
             builder: (context, state) {
+              // Keep controller in sync but prevent overwriting while editing
+              if (!_updating) {
+                _controller.text = state.speedLimit.toInt().toString();
+              }
+
               return Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  // ====== HEADER ======
-                  const Center(
-                    child: Text(
-                      "Settings",
-                      style: TextStyle(
-                        color: Colors.white,
-                        fontSize: 22,
-                        fontWeight: FontWeight.w700,
-                      ),
-                    ),
-                  ),
-                  const SizedBox(height: 30),
-
-                  // ====== SPEED LIMIT ======
+                  // ===== SPEED LIMIT =====
                   const Text(
                     "Speed Limit",
                     style: TextStyle(
@@ -81,9 +100,9 @@ class _SettingsPageState extends State<SettingsPage> {
                         SizedBox(
                           width: 70,
                           child: TextField(
-                            maxLength: 3,
                             controller: _controller,
                             keyboardType: TextInputType.number,
+                            maxLength: 3,
                             style: const TextStyle(
                               color: Colors.white,
                               fontSize: 18,
@@ -92,14 +111,11 @@ class _SettingsPageState extends State<SettingsPage> {
                               counterText: '',
                               border: InputBorder.none,
                             ),
-                            onSubmitted: (value) {
-                              final double? newLimit = double.tryParse(
-                                value.trim(),
-                              );
-                              if (newLimit != null && newLimit > 0) {
-                                context.read<SpeedBloc>().add(
-                                  UpdateSpeedLimit(newLimit),
-                                );
+                            onChanged: (value) {
+                              // Real-time update as user types
+                              if (value.isNotEmpty &&
+                                  double.tryParse(value) != null) {
+                                _updateLimit(value);
                               }
                             },
                           ),
@@ -117,12 +133,12 @@ class _SettingsPageState extends State<SettingsPage> {
                   ),
                   const SizedBox(height: 6),
                   Text(
-                    "Set the speed limit for alerts  (1–240 ${state.useMph ? "mph" : "km/h"})",
-                    style: TextStyle(color: Colors.white38, fontSize: 12),
+                    "Set alert threshold (1–240 ${state.useMph ? "mph" : "km/h"})",
+                    style: const TextStyle(color: Colors.white38, fontSize: 12),
                   ),
                   const SizedBox(height: 24),
 
-                  // ====== UNITS ======
+                  // ===== UNITS =====
                   const Text(
                     "Units",
                     style: TextStyle(
@@ -144,14 +160,14 @@ class _SettingsPageState extends State<SettingsPage> {
                         activeThumbColor: Colors.tealAccent,
                         value: state.useMph,
                         onChanged: (_) {
-                          context.read<SpeedBloc>().add(ToggleSpeedUnit());
+                          context.read<SpeedCubit>().toggleUnit();
                         },
                       ),
                     ],
                   ),
                   const SizedBox(height: 24),
 
-                  // ====== ALERTS ======
+                  // ===== ALERTS =====
                   const Text(
                     "Alerts",
                     style: TextStyle(
@@ -174,7 +190,7 @@ class _SettingsPageState extends State<SettingsPage> {
                         activeThumbColor: Colors.tealAccent,
                         value: state.soundEnabled,
                         onChanged: (_) {
-                          context.read<SpeedBloc>().add(ToggleSound());
+                          context.read<SpeedCubit>().toggleSound();
                         },
                       ),
                     ],
@@ -193,13 +209,11 @@ class _SettingsPageState extends State<SettingsPage> {
                         activeThumbColor: Colors.tealAccent,
                         value: state.vibrationEnabled,
                         onChanged: (_) {
-                          context.read<SpeedBloc>().add(ToggleVibration());
+                          context.read<SpeedCubit>().toggleVibration();
                         },
                       ),
                     ],
                   ),
-                  const SizedBox(height: 24),
-
                   const SizedBox(height: 40),
                 ],
               );
