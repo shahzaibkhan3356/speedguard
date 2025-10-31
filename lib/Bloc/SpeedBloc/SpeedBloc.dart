@@ -1,5 +1,4 @@
 import 'dart:async';
-import 'dart:developer';
 import 'dart:math' as math;
 
 import 'package:bloc/bloc.dart';
@@ -101,6 +100,19 @@ class SpeedCubit extends Cubit<SpeedState> {
   StreamSubscription<UserAccelerometerEvent>? _accelSub;
   StreamSubscription<GyroscopeEvent>? _gyroSub;
 
+  Timer? _motionTimer;
+  bool _motionDetected = false;
+  int _motionConfidence = 0; // 0–100 confidence
+  double _lastStableSpeed = 0.0;
+  @override
+  Future<void> close() {
+    _gpsSub?.cancel();
+    _accelSub?.cancel();
+    _gyroSub?.cancel();
+    _motionTimer?.cancel();
+    return super.close();
+  }
+
   SpeedCubit() : super(SpeedState.initial()) {
     _loadPreferences();
   }
@@ -117,21 +129,23 @@ class SpeedCubit extends Cubit<SpeedState> {
     );
   }
 
-  // ========== START / STOP ==========
+  // ====== START / STOP ======
   Future<void> start() async {
     emit(state.copyWith(isMeasuring: true));
     _startGps();
     _startSensors();
+    _startMotionTimer();
   }
 
   Future<void> stop() async {
     await _gpsSub?.cancel();
     await _accelSub?.cancel();
     await _gyroSub?.cancel();
+    _motionTimer?.cancel();
     emit(state.copyWith(isMeasuring: false, filteredSpeed: 0.0));
   }
 
-  // ========== GPS ==========
+  // ====== GPS ======
   void _startGps() {
     _gpsSub =
         Geolocator.getPositionStream(
@@ -145,14 +159,12 @@ class SpeedCubit extends Cubit<SpeedState> {
               : pos.speed * 3.6;
           final gpsAcc = pos.accuracy;
           final gpsStrength = _gpsStrength(gpsAcc);
-          log(
-            'GPS Speed: $gpsSpeed km/h, Acc: $gpsAcc m, Strength: $gpsStrength%',
-          );
+
           _processFusion(gpsSpeed, gpsAcc, gpsStrength);
         });
   }
 
-  // ========== SENSORS ==========
+  // ====== SENSOR INPUT ======
   void _startSensors() {
     _accelSub = userAccelerometerEventStream().listen((a) {
       final mag = math.sqrt(a.x * a.x + a.y * a.y + a.z * a.z);
@@ -167,7 +179,33 @@ class SpeedCubit extends Cubit<SpeedState> {
     });
   }
 
-  // ========== FUSION ==========
+  void _startMotionTimer() {
+    _motionTimer?.cancel();
+    int noMotionCount = 0;
+
+    _motionTimer = Timer.periodic(const Duration(milliseconds: 250), (_) {
+      final motion = _isLinearMotion();
+
+      if (motion) {
+        _motionConfidence = (_motionConfidence + 8).clamp(0, 100);
+        noMotionCount = 0;
+      } else {
+        _motionConfidence = (_motionConfidence - 12).clamp(0, 100);
+        noMotionCount++;
+      }
+
+      _motionDetected = _motionConfidence > 40;
+
+      // If no motion for 1.5s (6 cycles), lock to 0 instantly
+      if (noMotionCount >= 6 && _estimate < 4.0) {
+        _predictedSpeed = 0.0;
+        _estimate = 0.0;
+        emit(state.copyWith(filteredSpeed: 0.0, isMoving: false));
+      }
+    });
+  }
+
+  // ====== FUSION ======
   void _processFusion(double gpsSpeed, double gpsAcc, int gpsStrength) {
     final now = DateTime.now();
     final dt = now.difference(_lastUpdate).inMilliseconds / 1000.0;
@@ -178,7 +216,22 @@ class SpeedCubit extends Cubit<SpeedState> {
         : (_accelHistory.last - 9.81).clamp(-4.0, 4.0);
     _predictedSpeed = (_predictedSpeed + linearAccel * 3.6 * dt).clamp(0, 400);
 
-    final wGps = gpsStrength / 100.0;
+    // Noise filter: ignore spikes if no motion or large jump
+    final speedDiff = (gpsSpeed - _estimate).abs();
+    if (!_motionDetected && gpsSpeed < 2.0) {
+      _estimate = 0.0;
+      _lastStableSpeed = 0.0;
+      return;
+    }
+    if (speedDiff > 40 && !_motionDetected) return; // likely GPS glitch
+    // If very low motion and speed < 1.5 km/h, force zero
+    if (!_motionDetected && _estimate < 1.5) {
+      _estimate = 0.0;
+    }
+
+    // Adaptive weighting by GPS quality & motion confidence
+    double motionFactor = (_motionConfidence / 100).clamp(0.2, 1.0);
+    final wGps = (gpsStrength / 100.0) * motionFactor;
     final wSensor = 1 - wGps;
     final fused = gpsSpeed * wGps + _predictedSpeed * wSensor;
 
@@ -186,7 +239,9 @@ class SpeedCubit extends Cubit<SpeedState> {
 
     final moving = _estimate > 1.5;
     final over = _estimate > state.speedLimit;
-    final isLinear = _isLinearMotion();
+    final isLinear = _motionDetected;
+
+    _lastStableSpeed = _estimate;
 
     emit(
       state.copyWith(
@@ -202,7 +257,7 @@ class SpeedCubit extends Cubit<SpeedState> {
     );
   }
 
-  // ========== KALMAN ==========
+  // ====== KALMAN ======
   void _updateKalman(double meas, double gpsAcc) {
     final R = _adaptiveR(gpsAcc);
     final Q = gpsAcc > 15 ? 0.3 : 0.1;
@@ -238,8 +293,9 @@ class SpeedCubit extends Cubit<SpeedState> {
         ? 0
         : _gyroHistory.reduce((a, b) => a + b) / _gyroHistory.length;
 
-    const accelThreshold = 0.25;
-    const gyroThreshold = 0.2;
+    // Increased thresholds for stronger motion detection
+    const accelThreshold = 0.55; // was 0.12
+    const gyroThreshold = 0.35; // was 0.1
     return accelAvg > accelThreshold || gyroAvg > gyroThreshold;
   }
 
@@ -249,7 +305,7 @@ class SpeedCubit extends Cubit<SpeedState> {
     return conf.clamp(0, 100);
   }
 
-  // ========== SETTINGS ==========
+  // ====== SETTINGS ======
   Future<void> toggleSound() async {
     final prefs = await SharedPreferences.getInstance();
     final newVal = !state.soundEnabled;
